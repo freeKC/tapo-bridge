@@ -127,6 +127,33 @@ def load_cameras() -> list[Camera]:
 
 CHUNK = 64 * 1024
 
+# These cameras allow very few simultaneous streams, and every one this bridge holds
+# is one the Tapo app cannot have - the app reports "You've reached the live stream
+# limit" and refuses to change resolution. go2rtc reconnects without always closing
+# cleanly first, so without this the sessions pile up until nothing else can connect.
+# One session per camera, and a new client takes over from the old one.
+_ACTIVE: dict[str, object] = {}
+_ACTIVE_LOCK = asyncio.Lock()
+
+
+async def _release(name: str, streamer=None) -> None:
+    async with _ACTIVE_LOCK:
+        current = _ACTIVE.get(name)
+        target = streamer if streamer is not None else current
+        if target is None:
+            return
+        if streamer is None or current is streamer:
+            _ACTIVE.pop(name, None)
+    try:
+        await target.stop()
+    except Exception:
+        proc = getattr(target, "streamProcess", None)
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
 
 async def serve_camera(cam: Camera, request: web.Request) -> web.StreamResponse:
     peer = request.remote
@@ -156,10 +183,16 @@ async def serve_camera(cam: Camera, request: web.Request) -> web.StreamResponse:
         ff_args=cam.ff_args or None,
     )
 
+    # Take over from any session still held for this camera.
+    await _release(cam.name)
+    async with _ACTIVE_LOCK:
+        _ACTIVE[cam.name] = streamer
+
     try:
         await streamer.start()
     except Exception as exc:
         log.error("[%s] could not start stream: %s", cam.name, exc)
+        await _release(cam.name, streamer)
         return web.Response(status=502, text=f"Could not start stream: {exc}\n")
 
     proc = getattr(streamer, "streamProcess", None)
@@ -187,14 +220,8 @@ async def serve_camera(cam: Camera, request: web.Request) -> web.StreamResponse:
     except Exception as exc:
         log.warning("[%s] stream aborted after %d bytes: %s", cam.name, sent, exc)
     finally:
-        # Let the camera go back to sleep instead of holding the session open.
-        try:
-            await streamer.stop()
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        # Always release, so the camera's stream slot goes back to the app.
+        await _release(cam.name, streamer)
     return resp
 
 
@@ -221,6 +248,35 @@ def build_app(cameras: list[Camera]) -> web.Application:
     return app
 
 
+def attach_onvif(app: web.Application, cameras: list[Camera]) -> None:
+    """Expose the first camera's motor over ONVIF, for NVRs whose PTZ needs it.
+
+    Frigate's PTZ controls speak ONVIF and nothing else, and battery Tapos have none.
+    One camera only - ONVIF models a device, not a fleet.
+    """
+    if not _bool(os.environ.get("ONVIF_ENABLED"), False):
+        return
+    try:
+        from onvif_service import OnvifService, PtzController, attach
+    except ImportError as exc:
+        log.warning("ONVIF requested but unavailable: %s", exc)
+        return
+
+    cam = cameras[0]
+    advertise = os.environ.get("ONVIF_ADVERTISE_HOST", "127.0.0.1")
+    # The port Frigate must dial, which is the PUBLISHED one - not BRIDGE_PORT, the
+    # port inside the container. Getting this wrong advertises a URL nothing can reach.
+    port = int(os.environ.get("ONVIF_ADVERTISE_PORT",
+                              os.environ.get("BRIDGE_PORT", "8080")))
+    stream_uri = os.environ.get(
+        "ONVIF_STREAM_URI", f"http://{advertise}:{port}{cam.path}")
+
+    ptz = PtzController(lambda: Tapo(cam.host, cam.user, cam.password, cam.password))
+    attach(app, OnvifService(ptz, advertise, port, stream_uri, name=cam.name))
+    log.info("ONVIF enabled for %s at http://%s:%d/onvif/device_service",
+             cam.name, advertise, port)
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("BRIDGE_LOG_LEVEL", "INFO").upper(),
@@ -234,7 +290,9 @@ def main() -> None:
         log.info("serving %s (%s, quality=%s, audio=%s) at %s",
                  c.name, c.host, c.quality, c.include_audio, c.path)
 
-    web.run_app(build_app(cameras), host=host, port=port, access_log=None)
+    app = build_app(cameras)
+    attach_onvif(app, cameras)
+    web.run_app(app, host=host, port=port, access_log=None)
 
 
 if __name__ == "__main__":

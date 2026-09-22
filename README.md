@@ -138,6 +138,37 @@ That costs real CPU — prefer leaving it as `copy` and letting your NVR handle 
 
 ---
 
+## PTZ in Frigate
+
+Frigate's PTZ controls speak ONVIF exclusively, and these cameras have none. Set
+`ONVIF_ENABLED=1` and the bridge serves the subset Frigate calls — device, media and
+PTZ services — translating them into pytapo motor commands.
+
+```yaml
+# Frigate
+cameras:
+  backyard:
+    onvif:
+      host: 192.168.1.10      # the bridge, not the camera
+      port: 8189
+      user: onvif
+      password: onvif
+```
+
+Frigate then reports `features: ["pt"]` and the pan/tilt controls appear.
+
+Two things worth knowing:
+
+**Continuous movement is emulated.** Tapo has no continuous motion, only discrete
+steps, while ONVIF expects motion to persist from `ContinuousMove` until `Stop`. The
+bridge repeats small steps until a stop arrives, with the ONVIF velocity scaling the
+step size. Tune `STEP_DEGREES` and `STEP_INTERVAL` in `onvif_service.py` if it feels
+twitchy or sluggish.
+
+**Autotracking cannot work.** `GetStatus` returns a fixed origin because the Tapo API
+does not expose absolute position, and autotracking needs real positional feedback.
+That is a camera limitation, not something more shim work solves.
+
 ## Battery life
 
 The obvious worry is that an NVR holds the stream open continuously, keeping a camera
@@ -164,6 +195,21 @@ The bridge opens a camera session **only while a client is pulling**, so stoppin
 NVR lets the camera sleep normally.
 
 ---
+
+## The camera's stream limit
+
+These cameras allow very few simultaneous streams, and the bridge holds one whenever
+something is pulling. Open the Tapo app at the same time and it may report:
+
+> You've reached the live stream limit and cannot change the resolution.
+
+The bridge keeps **one session per camera**, and a new client takes over from the old
+one rather than stacking on top. Without that, go2rtc's reconnects — which do not
+always close cleanly first — pile up orphaned sessions until nothing else can connect
+at all.
+
+If the app still refuses after stopping the bridge, power-cycle the camera; it can
+hold a stale slot on its own side.
 
 ## Notes and limitations
 

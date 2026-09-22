@@ -6,7 +6,7 @@ RUN apt-get update \
 
 RUN pip install --no-cache-dir pytapo aiofiles aiohttp
 
-COPY bridge.py /app/bridge.py
+COPY bridge.py onvif_service.py /app/
 WORKDIR /app
 
 EXPOSE 8080
